@@ -1,0 +1,168 @@
+# PacBio selection
+
+```{r load_data_pacbio}
+load("data/data.Rdata")
+```
+
+## Phylogenetic diversity
+
+```{r phylogenetic_diversity, warning=FALSE, comments="", message=FALSE}
+phylogenetic_diversity <- genome_counts %>% 
+            filter(genome %in% genome_tree$tip.label) %>% 
+            column_to_rownames(var="genome") %>% 
+            select(where(~!all(. == 0))) %>% 
+            hilldiv(.,q=1,tree=genome_tree) %>% 
+            t() %>% 
+            as.data.frame() %>%
+            rename(phylogenetic=1) %>%
+            rownames_to_column(var="sample")
+```
+
+## DNA fractions
+
+```{r dna_fractions, warning=FALSE, comments="", message=FALSE}
+stats_raw <- read_tsv("data/multiqc_samtools_stats_genomes.tsv") %>%
+  mutate(
+    # Identify genome based on the pattern
+    genome = case_when(
+      str_detect(Sample, "Turkey_5.1") ~ "Turkey_5.1",
+      str_detect(Sample, "GRCg7b") ~ "GRCg7b",
+      str_detect(Sample, "GRCh38") ~ "GRCh38",
+      str_detect(Sample, "Hmelea") ~ "Hmelea",
+      str_detect(Sample, "Sscrofa11.1") ~ "Sscrofa11.1",
+      TRUE ~ NA_character_  # Default in case no pattern matches
+    ),
+    # Extract the sample by removing the genome from the filename
+    sample = str_remove(Sample, paste0(genome, "\\."))
+  ) %>% 
+  mutate(sample = gsub("\\.lib.*", "", sample)) %>% 
+  select(sample,raw_total_sequences) %>% 
+  group_by(sample) %>% 
+  summarise(raw=max(raw_total_sequences))
+
+stats_genomes <- read_tsv("data/multiqc_samtools_stats_genomes.tsv") %>%
+  mutate(
+    # Identify genome based on the pattern
+    genome = case_when(
+      str_detect(Sample, "Turkey_5.1") ~ "Turkey_5.1",
+      str_detect(Sample, "GRCg7b") ~ "GRCg7b",
+      str_detect(Sample, "GRCh38") ~ "GRCh38",
+      str_detect(Sample, "Hmelea") ~ "Hmelea",
+      str_detect(Sample, "Sscrofa11.1") ~ "Sscrofa11.1",
+      TRUE ~ NA_character_  # Default in case no pattern matches
+    ),
+    # Extract the sample by removing the genome from the filename
+    sample = str_remove(Sample, paste0(genome, "\\."))
+  ) %>% 
+  mutate(sample = gsub("\\.lib.*", "", sample)) %>% 
+  select(sample,genome,reads_mapped) %>%
+  pivot_wider(names_from = genome, values_from = reads_mapped)
+
+
+stats_mags <- read_tsv("data/multiqc_samtools_stats_mags.tsv") %>% 
+  rename(sample=Sample) %>% 
+  mutate(sample = gsub(".lib1.stats.tsv", "", sample, fixed = TRUE)) %>% 
+  select(sample,reads_mapped) %>%
+  rename(mags=reads_mapped)
+  
+dna_fractions <- stats_raw %>% 
+  left_join(stats_genomes, by="sample") %>% 
+  left_join(stats_mags, by="sample")  %>% 
+  rowwise() %>% 
+  mutate(host_percentage=Turkey_5.1/raw) %>% 
+  mutate(pathogen_percentage=Hmelea/raw) %>% 
+  mutate(human_percentage=GRCh38/raw) %>% 
+  mutate(mag_percentage=mags/raw) %>% 
+  mutate(other_percentage=1-(host_percentage+pathogen_percentage+human_percentage+mag_percentage))
+
+dna_fractions %>% 
+  select(sample,host_percentage,human_percentage,pathogen_percentage,mag_percentage,other_percentage) %>% 
+  arrange(-mag_percentage) %>% 
+  tt()
+```
+
+```{r dna_fractions_plot, warning=FALSE, comments="", message=FALSE}
+dna_fractions %>% 
+  select(sample,host_percentage,human_percentage,pathogen_percentage,mag_percentage,other_percentage) %>% 
+  pivot_longer(!sample, names_to="fraction", values_to="value") %>% 
+  ggplot(aes(x = sample, y = value, fill=fraction)) +
+	    geom_bar(position="stack", stat = "identity") +
+      scale_fill_manual(values=c("#bcdee1", "#CCCCCC","#93655c","#d8b8a3","#99cc00"))+
+	    labs(x = "Samples", y = "Amount of data (GB)") +
+	    theme_classic() +
+	    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size=6),legend.position = "bottom")
+```
+
+
+## TOP10 candidate samples
+
+```{r select_samples, warning=FALSE, comments="", message=FALSE}
+#Select top10
+selection <- phylogenetic_diversity  %>%
+    left_join(sample_metadata,by="sample") %>%
+    arrange(-phylogenetic) %>%
+    unique() %>% 
+    select(sample) %>%
+    slice(1:80) %>%
+    pull()
+
+#Print statistics
+phylogenetic_diversity %>%
+    left_join(sample_metadata,by="sample") %>% 
+    arrange(-phylogenetic) %>%
+    unique() %>% 
+    slice(1:80) %>%
+    mutate(number_of_genomes=genome_counts_filt %>%
+               select(all_of(c("genome",selection))) %>%
+               summarise(across(starts_with("D"), ~ sum(. != 0))) %>% t()) %>%
+    left_join(dna_fractions,by="sample") %>% 
+    select(sample, treatment, phylogenetic,, number_of_genomes, mag_percentage) %>%
+    rename(phylogenetic_diversity=phylogenetic) %>%
+    tt()
+```
+
+We will need to select a representation of trials and treatments with high microbial fractions and diversities to optimise pacbio sequencing as much as we can.
+
+```{r genomecounts_pacbio, warning=FALSE, comments="", message=FALSE, fig.height=8, fig.width=10, fig.fullwidth=TRUE}
+vertical_tree <- force.ultrametric(genome_tree,method="extend") %>%
+        ggtree(., size = 0.3)
+
+#Add phylum colors
+phylum_colors <- read_tsv("https://raw.githubusercontent.com/earthhologenome/EHI_taxonomy_colour/main/ehi_phylum_colors.tsv") %>%
+  right_join(genome_metadata, by=join_by(phylum == phylum)) %>%
+    arrange(match(genome, genome_tree$tip.label)) %>%
+    mutate(phylum = factor(phylum, levels = unique(phylum))) %>%
+    column_to_rownames(var = "genome") %>%
+    select(phylum)
+
+
+colors_alphabetic <- read_tsv("https://raw.githubusercontent.com/earthhologenome/EHI_taxonomy_colour/main/ehi_phylum_colors.tsv") %>%
+  right_join(genome_metadata, by=join_by(phylum == phylum)) %>%
+  arrange(match(genome, genome_tree$tip.label)) %>%
+  select(phylum, colors) %>%
+    unique() %>%
+    arrange(phylum) %>%
+    select(colors) %>%
+    pull()
+
+vertical_tree <- gheatmap(vertical_tree, phylum_colors, offset=-0.6, width=0.1, colnames=FALSE) +
+    scale_fill_manual(values=colors_alphabetic) +
+    new_scale_fill()
+
+#Add genome counts of d0
+genome_counts_selection <- genome_counts_filt %>%
+          select(all_of(c("genome",selection))) %>% 
+          column_to_rownames(var="genome") %>% tss()
+
+vertical_tree <- gheatmap(vertical_tree, log10(genome_counts_selection), offset=-0.4, width=0.8, colnames=TRUE, colnames_angle=90, font.size=3, colnames_position="top", colnames_offset_y = 15) +
+    vexpand(.08) +
+    coord_cartesian(clip = "off") +
+    scale_fill_gradient(low = "lightblue", high = "#315b7d", na.value="#f4f4f4") +
+    new_scale_fill()
+
+vertical_tree +
+  theme(legend.position='none')
+```
+
+Top 10 diversity samples are sorted from left to right.
+
